@@ -1,0 +1,422 @@
+---
+title: "Single-Cell Batch-Correction Evaluation"
+author: "Taher Alabbar"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  pdf_document:
+    toc: true
+params:
+  seurat_rds: !r NULL
+  seurat_object_name: !r NULL
+  tenx_data_root: "data/panc8"
+  tenx_batches: !r c("celseq", "celseq2", "fluidigmc1", "smartseq2", "indrop")
+  batch_col: "batch"
+  cell_type_col: "cell_type"
+  assay: "RNA"
+  reference_cell_type: "alpha"
+  beta_cell_type: "beta"
+  n_dims: 30
+  n_variable_features: 2000
+  scale_all_genes: true
+  future_globals_max_size_gb: 8
+  min_cells_per_group: 10
+  max_cells_per_group: 500
+  max_pairs_per_comparison: 10000
+  seed: 123
+  output_dir: "output"
+  selected_overlay_batch_pairs: !r NULL
+  selected_overlay_cell_types: !r c("alpha", "beta")
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.align = "center",
+  dpi = 300,
+  out.width = "100%"
+)
+
+source(file.path("scripts", "package_setup.R"))
+source(file.path("scripts", "data_loading.R"))
+source(file.path("scripts", "evaluation_utils.R"))
+source(file.path("scripts", "plot_utils.R"))
+```
+
+# Overview
+
+This report evaluates batch-correction methods for annotated single-cell RNA-seq
+data. It compares:
+
+- `Uncorrected_PCA`
+- `FastMNN`
+- `MNN`
+- `Seurat_CCA`
+
+Each method is evaluated with two complementary diagnostics:
+
+- Technical mixing: same-cell-type cross-batch distances should resemble
+  same-cell-type within-batch distances.
+- Biological preservation: alpha-centered cell-type separation should remain
+  similar to the uncorrected representation.
+
+# Configuration
+
+```{r config}
+batch_col <- params$batch_col
+cell_type_col <- params$cell_type_col
+assay_name <- params$assay
+reference_cell_type <- params$reference_cell_type
+beta_cell_type <- params$beta_cell_type
+n_dims <- params$n_dims
+n_variable_features <- params$n_variable_features
+scale_all_genes <- params$scale_all_genes
+future_globals_max_size_gb <- params$future_globals_max_size_gb
+min_cells_per_group <- params$min_cells_per_group
+max_cells_per_group <- params$max_cells_per_group
+max_pairs_per_comparison <- params$max_pairs_per_comparison
+seed <- params$seed
+
+options(future.globals.maxSize = future_globals_max_size_gb * 1024^3)
+future::plan(future::sequential)
+set.seed(seed)
+
+output_dir <- params$output_dir
+figures_dir <- file.path(output_dir, "figures")
+tables_dir <- file.path(output_dir, "tables")
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+
+tibble(
+  setting = c(
+    "tenx_data_root",
+    "tenx_batches",
+    "batch_col",
+    "cell_type_col",
+    "assay",
+    "reference_cell_type",
+    "n_dims",
+    "max_cells_per_group",
+    "max_pairs_per_comparison"
+  ),
+  value = c(
+    params$tenx_data_root,
+    paste(params$tenx_batches, collapse = ", "),
+    batch_col,
+    cell_type_col,
+    assay_name,
+    reference_cell_type,
+    n_dims,
+    max_cells_per_group,
+    max_pairs_per_comparison
+  )
+)
+```
+
+# Input Seurat Object
+
+Use one of these inputs:
+
+- `seurat_rds`: path to a saved `.rds` Seurat object.
+- `seurat_object_name`: name of an already-loaded Seurat object.
+- `tenx_data_root`: folder containing 10x batch directories.
+
+```{r load-seurat-object}
+seu <- load_input_seurat_object(
+  seurat_rds_path = params$seurat_rds,
+  seurat_object_name = params$seurat_object_name,
+  tenx_data_root = params$tenx_data_root,
+  tenx_batches = params$tenx_batches,
+  batch_col = batch_col,
+  cell_type_col = cell_type_col
+)
+
+if (!inherits(seu, "Seurat")) {
+  stop("`seu` must be a Seurat object.", call. = FALSE)
+}
+
+seu
+```
+
+# Normalize And Select Variable Genes
+
+```{r qc-normalize}
+SeuratObject::DefaultAssay(seu) <- assay_name
+
+seu <- Seurat::NormalizeData(seu, verbose = FALSE)
+seu <- Seurat::FindVariableFeatures(
+  seu,
+  selection.method = "vst",
+  nfeatures = n_variable_features,
+  verbose = FALSE
+)
+
+pca_features <- SeuratObject::VariableFeatures(seu)
+
+if (length(pca_features) == 0) {
+  stop("No variable features were selected for PCA.", call. = FALSE)
+}
+
+features_to_scale <- if (isTRUE(scale_all_genes)) {
+  rownames(seu)
+} else {
+  pca_features
+}
+
+seu <- Seurat::ScaleData(
+  seu,
+  features = features_to_scale,
+  verbose = FALSE
+)
+
+tibble(
+  n_cells = ncol(seu),
+  n_genes = nrow(seu),
+  n_variable_features = length(pca_features),
+  n_scaled_features = length(features_to_scale)
+)
+```
+
+```{r cell-counts}
+table(seu[[batch_col]][, 1])
+table(seu[[cell_type_col]][, 1], seu[[batch_col]][, 1], useNA = "ifany")
+```
+
+# Build Representations
+
+All distance comparisons are made inside a representation and normalized inside
+that same representation. The report does not compare raw original-space
+distances directly against corrected embedding distances.
+
+```{r build-representations}
+metadata <- check_required_metadata(seu, batch_col, cell_type_col, assay_name)
+
+pca_result <- run_uncorrected_pca_embedding(
+  seu = seu,
+  assay_name = assay_name,
+  n_dims = n_dims,
+  n_variable_features = n_variable_features,
+  seed = seed
+)
+
+metadata <- check_required_metadata(pca_result$object, batch_col, cell_type_col, assay_name)
+metadata <- metadata[colnames(pca_result$object), , drop = FALSE]
+
+fastmnn_embedding <- run_fastmnn_embedding(
+  seu = pca_result$object,
+  metadata = metadata,
+  batch_col = batch_col,
+  assay_name = assay_name,
+  features = pca_result$features,
+  n_dims = n_dims,
+  seed = seed + 1
+)
+
+mnn_embedding <- run_mnn_embedding(
+  seu = pca_result$object,
+  metadata = metadata,
+  batch_col = batch_col,
+  assay_name = assay_name,
+  features = pca_result$features,
+  n_dims = n_dims,
+  seed = seed + 2
+)
+
+cca_result <- run_seurat_cca_embedding(
+  seu = seu,
+  batch_col = batch_col,
+  assay_name = assay_name,
+  n_dims = n_dims,
+  n_variable_features = n_variable_features,
+  seed = seed + 3
+)
+
+embeddings <- list(
+  Uncorrected_PCA = pca_result$embedding,
+  FastMNN = fastmnn_embedding,
+  MNN = mnn_embedding,
+  Seurat_CCA = cca_result$embedding
+)
+
+embeddings <- imap(embeddings, ~ align_embedding(.x, metadata, .y))
+
+embedding_dimensions <- tibble(
+  method = names(embeddings),
+  n_cells = vapply(embeddings, nrow, numeric(1)),
+  n_dimensions = vapply(embeddings, ncol, numeric(1))
+)
+
+embedding_dimensions
+```
+
+# Technical Batch-Shift Metrics
+
+For each method, cell type, and batch pair:
+
+```text
+R_tech = median cross-batch same-cell-type distance /
+         median within-batch same-cell-type baseline
+```
+
+The target is `R_tech` near 1. The score `abs(log(R_tech))` is lower when the
+ratio is closer to 1.
+
+```{r compute-technical-metrics}
+technical_results <- imap(embeddings, function(embedding, method_name) {
+  compute_technical_metrics_for_embedding(
+    embedding = embedding,
+    metadata = metadata,
+    batch_col = batch_col,
+    cell_type_col = cell_type_col,
+    method = method_name,
+    min_cells_per_group = min_cells_per_group,
+    max_cells_per_group = max_cells_per_group,
+    max_pairs_per_comparison = max_pairs_per_comparison,
+    seed = seed
+  )
+})
+
+technical_summary <- bind_rows(map(technical_results, "summary"))
+technical_distance_samples <- bind_rows(map(technical_results, "distances"))
+
+readr::write_csv(technical_summary, file.path(tables_dir, "technical_summary.csv"))
+readr::write_csv(technical_distance_samples, file.path(tables_dir, "technical_distance_samples.csv"))
+
+technical_summary
+```
+
+```{r plot-technical-ratio-heatmap, fig.width=12, fig.height=8}
+p_technical_ratio <- plot_technical_ratio_heatmap(technical_summary)
+p_technical_ratio
+save_plot(p_technical_ratio, "technical_ratio_heatmap.png", width = 12, height = 8)
+```
+
+```{r plot-technical-deviation-heatmap, fig.width=12, fig.height=8}
+p_technical_deviation <- plot_technical_deviation_heatmap(technical_summary)
+p_technical_deviation
+save_plot(p_technical_deviation, "technical_deviation_heatmap.png", width = 12, height = 8)
+```
+
+```{r plot-technical-scatter, fig.width=10, fig.height=7}
+technical_scatter <- make_technical_scatter_data(technical_summary)
+readr::write_csv(technical_scatter, file.path(tables_dir, "technical_before_after_scatter_data.csv"))
+
+p_technical_scatter <- plot_technical_scatter(technical_scatter)
+p_technical_scatter
+save_plot(p_technical_scatter, "technical_before_after_scatter.png", width = 10, height = 7)
+```
+
+```{r plot-cross-vs-within-overlay, fig.width=24, fig.height=28}
+technical_overlay <- filter_overlay_distances(
+  technical_distance_samples,
+  selected_batch_pairs = params$selected_overlay_batch_pairs,
+  selected_cell_types = params$selected_overlay_cell_types
+)
+
+p_cross_within <- plot_cross_vs_within_overlay(technical_overlay)
+p_cross_within
+save_plot(p_cross_within, "cross_vs_within_normalized_overlay.png", width = 24, height = 28)
+```
+
+# Biological Structure Preservation Metrics
+
+For each method, batch, and target cell type, distances are centered on the
+reference cell type. With `reference_cell_type = "alpha"`:
+
+```text
+relative_distance = pairwise alpha-to-target distance /
+                    median alpha-to-alpha within-batch distance
+```
+
+The summary is the mean of pairwise relative distances, not a ratio of medians.
+
+```{r compute-biological-metrics}
+biological_results <- imap(embeddings, function(embedding, method_name) {
+  compute_biological_metrics_for_embedding(
+    embedding = embedding,
+    metadata = metadata,
+    batch_col = batch_col,
+    cell_type_col = cell_type_col,
+    method = method_name,
+    reference_cell_type = reference_cell_type,
+    min_cells_per_group = min_cells_per_group,
+    max_cells_per_group = max_cells_per_group,
+    max_pairs_per_comparison = max_pairs_per_comparison,
+    seed = seed
+  )
+})
+
+biological_summary <- bind_rows(map(biological_results, "summary"))
+biological_distance_samples <- bind_rows(map(biological_results, "distances"))
+biological_delta <- compute_biological_geometry_delta(biological_summary)
+
+readr::write_csv(biological_summary, file.path(tables_dir, "biological_summary.csv"))
+readr::write_csv(biological_distance_samples, file.path(tables_dir, "biological_distance_samples.csv"))
+readr::write_csv(biological_delta, file.path(tables_dir, "biological_signed_geometry_delta.csv"))
+
+biological_summary
+```
+
+```{r plot-alpha-beta-distribution, fig.width=11, fig.height=7}
+p_alpha_beta <- plot_alpha_beta_distribution(
+  biological_distance_samples,
+  beta_cell_type = beta_cell_type
+)
+p_alpha_beta
+save_plot(p_alpha_beta, "alpha_beta_relative_distance_distribution.png", width = 11, height = 7)
+```
+
+```{r plot-mean-relative-heatmap, fig.width=12, fig.height=8}
+p_mean_relative <- plot_mean_relative_heatmap(biological_summary)
+p_mean_relative
+save_plot(p_mean_relative, "mean_relative_separation_heatmap.png", width = 12, height = 8)
+```
+
+```{r plot-biological-scatter, fig.width=10, fig.height=7}
+biological_scatter <- make_biological_scatter_data(biological_summary)
+readr::write_csv(biological_scatter, file.path(tables_dir, "biological_before_after_scatter_data.csv"))
+
+p_biological_scatter <- plot_biological_scatter(biological_scatter)
+p_biological_scatter
+save_plot(p_biological_scatter, "biological_preservation_scatter.png", width = 10, height = 7)
+```
+
+```{r plot-signed-delta-heatmap, fig.width=12, fig.height=8}
+p_signed_delta <- plot_signed_delta_heatmap(biological_delta)
+p_signed_delta
+save_plot(p_signed_delta, "signed_biological_geometry_delta_heatmap.png", width = 12, height = 8)
+```
+
+# Final Method Summary
+
+```{r final-summary-table}
+final_method_summary <- make_final_method_summary(
+  technical_summary = technical_summary,
+  biological_summary = biological_summary,
+  biological_delta = biological_delta,
+  beta_cell_type = beta_cell_type,
+  baseline_method = "Uncorrected_PCA"
+)
+
+readr::write_csv(final_method_summary, file.path(tables_dir, "final_method_summary.csv"))
+
+final_method_summary
+```
+
+# Interpretation Guide
+
+Lower technical score means corrected same-cell-type cells mix better across
+batches. Biological preservation should be read alongside the technical score:
+a method that mixes batches well is only useful if alpha-centered cell-type
+separation does not collapse toward the reference baseline.
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
