@@ -1,0 +1,337 @@
+---
+title: "Pairwise Batch Distance Analysis"
+author: "Taher Alabbar"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  pdf_document:
+    toc: true
+params:
+  data_root: "data/panc8"
+  batches:
+    - "celseq"
+    - "celseq2"
+    - "fluidigmc1"
+    - "smartseq2"
+    - "indrop"
+  primary_batches:
+    - "celseq"
+    - "celseq2"
+  assay: "RNA"
+  distance_layer: "scale.data"
+  feature_mode: "variable"
+  n_variable_features: 2000
+  min_cells: 3
+  min_features: 200
+  min_cells_per_type: 20
+  max_cells_per_type_per_batch: 250
+  sample_per_group: 5000
+  seed: 123
+  write_outputs: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 7,
+  dpi = 300,
+  out.width = "100%"
+)
+
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+
+source(file.path("scripts", "pairwise_distance_utils.R"))
+
+theme_set(theme_minimal(base_size = 11))
+```
+
+# Overview
+
+This report compares cells with the same annotated cell type across pairs of
+single-cell RNA-seq batches. For each batch pair and shared cell type, it
+calculates all cross-batch Euclidean distances in the selected expression space.
+
+The main plots show:
+
+- one selected batch-pair comparison in detail
+- all batch pairs overlaid within each cell type
+- a batch-pair grid where each panel contains the cell-type distance distributions
+- heatmaps of mean, median, and standard-deviation distance summaries
+
+# Analysis Settings
+
+```{r analysis-settings}
+set.seed(params$seed)
+
+batches <- as.character(unlist(params$batches, use.names = FALSE))
+primary_batches <- as.character(unlist(params$primary_batches, use.names = FALSE))
+
+if (length(primary_batches) != 2) {
+  stop("primary_batches must contain exactly two batch names.")
+}
+
+if (!all(primary_batches %in% batches)) {
+  stop("primary_batches must be included in params$batches.")
+}
+
+data_root <- resolve_data_root(params$data_root)
+dataset_dirs <- make_dataset_dirs(data_root, batches)
+primary_batch_label <- make_batch_label(primary_batches)
+
+data.frame(
+  setting = c(
+    "data_root",
+    "batches",
+    "primary_batches",
+    "distance_layer",
+    "feature_mode",
+    "min_cells_per_type",
+    "max_cells_per_type_per_batch"
+  ),
+  value = c(
+    data_root,
+    paste(batches, collapse = ", "),
+    paste(primary_batches, collapse = ", "),
+    params$distance_layer,
+    params$feature_mode,
+    params$min_cells_per_type,
+    params$max_cells_per_type_per_batch
+  )
+)
+```
+
+# Load And Preprocess Data
+
+```{r load-data}
+seu <- load_10x_batches(
+  dataset_dirs = dataset_dirs,
+  min_cells = params$min_cells,
+  min_features = params$min_features
+)
+
+seu
+```
+
+```{r preprocess-data}
+seu <- NormalizeData(seu, verbose = FALSE)
+seu <- FindVariableFeatures(
+  seu,
+  selection.method = "vst",
+  nfeatures = params$n_variable_features,
+  verbose = FALSE
+)
+
+if (identical(params$distance_layer, "scale.data")) {
+  scale_features <- if (identical(params$feature_mode, "all")) {
+    rownames(seu)
+  } else {
+    VariableFeatures(seu)
+  }
+
+  seu <- ScaleData(seu, features = scale_features, verbose = FALSE)
+}
+```
+
+```{r cell-counts}
+table(seu$batch)
+table(seu$cell_type, seu$batch, useNA = "ifany")
+```
+
+```{r select-features}
+expression_matrix <- get_expression_layer(
+  seurat_object = seu,
+  assay = params$assay,
+  layer = params$distance_layer
+)
+
+distance_features <- select_distance_features(
+  seurat_object = seu,
+  expression_matrix = expression_matrix,
+  feature_mode = params$feature_mode,
+  n_features = params$n_variable_features
+)
+
+data.frame(
+  distance_layer = params$distance_layer,
+  feature_mode = params$feature_mode,
+  n_features = length(distance_features)
+)
+```
+
+# Primary Batch Pair
+
+```{r primary-distances}
+primary_distances <- calculate_matching_celltype_distances(
+  seurat_object = seu,
+  batch_a = primary_batches[1],
+  batch_b = primary_batches[2],
+  assay = params$assay,
+  layer = params$distance_layer,
+  features = distance_features,
+  min_cells_per_type = params$min_cells_per_type,
+  max_cells_per_type_per_batch = params$max_cells_per_type_per_batch,
+  seed = params$seed
+)
+
+primary_summary <- summarise_distances(
+  primary_distances,
+  group_cols = "cell_type"
+) |>
+  arrange(mean_distance)
+
+primary_summary
+```
+
+```{r primary-cell-types}
+sort(unique(primary_distances$cell_type))
+```
+
+```{r primary-histograms}
+plot_celltype_histograms(
+  primary_distances,
+  title = "Cross-batch distances for matching cell types",
+  subtitle = paste(primary_batch_label, "in", params$distance_layer)
+)
+```
+
+```{r primary-boxplot, fig.height=6}
+plot_celltype_boxplot(
+  primary_distances,
+  title = "Distance distributions for matching cell types",
+  subtitle = paste(primary_batch_label, "in", params$distance_layer)
+)
+```
+
+```{r primary-density, fig.height=6}
+plot_celltype_density(
+  primary_distances,
+  title = "Distance distributions for matching cell types",
+  subtitle = paste(primary_batch_label, "in", params$distance_layer)
+)
+```
+
+# All Batch Pairs
+
+```{r all-pair-distances}
+all_matching_distances <- calculate_all_batchpair_celltype_distances(
+  seurat_object = seu,
+  batches = batches,
+  assay = params$assay,
+  layer = params$distance_layer,
+  features = distance_features,
+  min_cells_per_type = params$min_cells_per_type,
+  max_cells_per_type_per_batch = params$max_cells_per_type_per_batch,
+  seed = params$seed
+)
+
+dim(all_matching_distances)
+```
+
+```{r all-pair-comparisons}
+all_matching_distances |>
+  distinct(batch_pair, cell_type, n_cells_a, n_cells_b) |>
+  arrange(batch_pair, cell_type)
+```
+
+```{r plot-sample}
+all_matching_distances_sample <- sample_distance_table(
+  distance_table = all_matching_distances,
+  group_cols = c("batch_pair", "cell_type"),
+  n_per_group = params$sample_per_group,
+  seed = params$seed
+)
+```
+
+```{r all-pair-density-by-celltype, fig.width=16, fig.height=12}
+plot_batchpair_density_by_celltype(
+  all_matching_distances_sample,
+  title = "Cross-batch same-cell-type distance distributions",
+  subtitle = "Each panel is one cell type; colors show batch pairs"
+)
+```
+
+```{r all-pair-matrix-density, fig.width=16, fig.height=11}
+plot_batchpair_matrix_density(
+  all_matching_distances_sample,
+  title = "Batch-pair grid of same-cell-type distance distributions",
+  subtitle = "Each grid panel is one batch pair; colors show cell types"
+)
+```
+
+# Summary Heatmaps
+
+```{r all-pair-summary}
+all_distance_summary <- summarise_distances(
+  all_matching_distances,
+  group_cols = c("batch_pair", "cell_type")
+) |>
+  arrange(cell_type, mean_distance)
+
+all_distance_summary
+```
+
+```{r median-distance-heatmap, fig.width=11, fig.height=7}
+plot_distance_heatmap(
+  all_distance_summary,
+  value_column = "median_distance",
+  title = "Median distances between matching cell types across batches",
+  subtitle = paste("Euclidean distances in", params$distance_layer),
+  fill_label = "Median\ndistance"
+)
+```
+
+```{r sd-distance-heatmap, fig.width=11, fig.height=7}
+plot_distance_heatmap(
+  all_distance_summary,
+  value_column = "sd_distance",
+  title = "Standard deviation of matching-cell-type distances",
+  subtitle = paste("Euclidean distances in", params$distance_layer),
+  fill_label = "SD\ndistance"
+)
+```
+
+```{r mean-distance-heatmap, fig.width=11, fig.height=7}
+plot_distance_heatmap(
+  all_distance_summary,
+  value_column = "mean_distance",
+  title = "Mean distances between matching cell types across batches",
+  subtitle = paste("Euclidean distances in", params$distance_layer),
+  fill_label = "Mean\ndistance"
+)
+```
+
+# Export Tables
+
+```{r export-tables}
+if (isTRUE(params$write_outputs)) {
+  dir.create("output", showWarnings = FALSE)
+
+  write.csv(
+    primary_summary,
+    file = file.path("output", "primary_pair_distance_summary.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    all_distance_summary,
+    file = file.path("output", "all_pair_distance_summary.csv"),
+    row.names = FALSE
+  )
+}
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
